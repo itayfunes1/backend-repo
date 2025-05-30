@@ -4,20 +4,26 @@ const { v4: uuidv4 } = require('uuid');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 const rateLimit = require('express-rate-limit');
+const fs = require('fs');
 
 const app = express();
-app.use(cors({ origin: 'http://localhost:8080' }));
+
+// Configure CORS only for your dashboard
+app.use(cors({ origin: 'https://dashboard.rythenox.com' }));
 app.use(express.json());
 app.set('trust proxy', true);
 
+// Initialize SQLite DB
 const db = new sqlite3.Database(path.join(__dirname, 'marengo.db'));
 
+// Rate limiter for license verification
 const licenseLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
   message: { success: false, error: "Too many attempts. Try again later." }
 });
 
+// Whitelisted files
 const allowedFiles = [
   'marengo-win.exe',
   'marengo-linux',
@@ -25,7 +31,7 @@ const allowedFiles = [
   'documentation.pdf'
 ];
 
-// ✅ LICENSE VERIFICATION
+// ✅ License Verification Endpoint
 app.post('/api/auth/verify-license', licenseLimiter, (req, res) => {
   const { licenseKey } = req.body;
   if (!licenseKey) {
@@ -69,11 +75,11 @@ app.post('/api/auth/verify-license', licenseLimiter, (req, res) => {
   });
 });
 
-// ✅ DOWNLOAD ROUTE
+// ✅ Download Route
 app.post('/api/download/:file', (req, res) => {
   const { licenseKey } = req.body;
   const fileName = req.params.file;
-  const userIP = req.headers['x-forwarded-for'] || req.ip;
+  const userIP = req.headers['x-forwarded-for'] || req.connection?.remoteAddress || 'unknown';
 
   if (!licenseKey) {
     return res.status(400).json({ success: false, error: "Missing license key." });
@@ -91,15 +97,23 @@ app.post('/api/download/:file', (req, res) => {
     db.run("INSERT INTO downloads (license_id, file, ip) VALUES (?, ?, ?)", [row.id, fileName, userIP]);
 
     const filePath = path.join(__dirname, 'downloads', fileName);
-    res.download(filePath, err => {
+    fs.access(filePath, fs.constants.F_OK, (err) => {
       if (err) {
-        console.error("File download error:", err.message);
-        res.status(404).json({ success: false, error: "File not found." });
+        console.error("File not found:", filePath);
+        return res.status(404).json({ success: false, error: "File not found." });
       }
+
+      res.download(filePath, err => {
+        if (err) {
+          console.error("File download error:", err.message);
+          res.status(500).json({ success: false, error: "Download failed." });
+        }
+      });
     });
   });
 });
 
+// ✅ Server Init
 app.listen(5000, () => {
   console.log("✅ Marengo secure backend running on http://localhost:5000");
 });
