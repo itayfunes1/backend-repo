@@ -5,33 +5,30 @@ const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 const rateLimit = require('express-rate-limit');
 const fs = require('fs');
+const AWS = require('aws-sdk');
 
 const app = express();
+const BUCKET_NAME = 'rythenox-downloads';
+const REGION = 'eu-central-1';
 
-// Configure CORS only for your dashboard
+AWS.config.update({ region: REGION });
+const s3 = new AWS.S3({ signatureVersion: 'v4' });
+
 app.use(cors({ origin: 'https://dashboard.rythenox.com' }));
 app.use(express.json());
 app.set('trust proxy', true);
 
-// Initialize SQLite DB
+// SQLite DB
 const db = new sqlite3.Database(path.join(__dirname, 'marengo.db'));
 
-// Rate limiter for license verification
+// License Rate Limiter
 const licenseLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
   message: { success: false, error: "Too many attempts. Try again later." }
 });
 
-// Whitelisted files
-const allowedFiles = [
-  'marengo-win.exe',
-  'marengo-linux',
-  'gui-builder.exe',
-  'documentation.pdf'
-];
-
-// ✅ License Verification Endpoint
+// ✅ License Verification
 app.post('/api/auth/verify-license', licenseLimiter, (req, res) => {
   const { licenseKey } = req.body;
   if (!licenseKey) {
@@ -52,14 +49,10 @@ app.post('/api/auth/verify-license', licenseLimiter, (req, res) => {
     const expiry = new Date(row.expiry);
 
     if (expiry < now) {
-      return res.status(403).json({
-        success: false,
-        error: "License has expired. Please contact support@rythenox.com."
-      });
+      return res.status(403).json({ success: false, error: "License has expired." });
     }
 
     const sessionId = "sess-" + uuidv4();
-
     return res.json({
       success: true,
       sessionId,
@@ -75,87 +68,74 @@ app.post('/api/auth/verify-license', licenseLimiter, (req, res) => {
   });
 });
 
-// ✅ Download Route
-app.post('/api/download/:file', (req, res) => {
-  const { licenseKey } = req.body;
-  const fileName = req.params.file;
-  const userIP = req.headers['x-forwarded-for'] || req.connection?.remoteAddress || 'unknown';
+// ✅ List Available Files from S3
+app.get('/api/downloads/available', async (req, res) => {
+  try {
+    const data = await s3.listObjectsV2({ Bucket: BUCKET_NAME }).promise();
 
-  if (!licenseKey) {
-    return res.status(400).json({ success: false, error: "Missing license key." });
+    const files = await Promise.all(data.Contents.map(async (file) => {
+      const head = await s3.headObject({ Bucket: BUCKET_NAME, Key: file.Key }).promise();
+
+      const id = path.basename(file.Key).replace(/\.[^/.]+$/, '').toLowerCase();
+      const ext = path.extname(file.Key).toLowerCase();
+      const type = ext === '.pdf' ? 'PDF' : 'Binary';
+      const os = file.Key.toLowerCase().includes('linux') ? 'Linux'
+              : file.Key.toLowerCase().includes('win') ? 'Windows'
+              : 'All';
+
+      return {
+        id,
+        name: path.basename(file.Key),
+        type,
+        size: `${(head.ContentLength / (1024 * 1024)).toFixed(1)} MB`,
+        os,
+        icon: type === 'PDF' ? '📚' : os === 'Windows' ? '🪟' : os === 'Linux' ? '🐧' : '💾',
+        requiresLicense: true,
+      };
+    }));
+
+    res.json(files);
+  } catch (err) {
+    console.error("S3 List Error:", err);
+    res.status(500).json({ error: "Failed to list files." });
   }
-
-  if (!allowedFiles.includes(fileName)) {
-    return res.status(403).json({ success: false, error: "Unauthorized file request." });
-  }
-
-  db.get("SELECT id FROM licenses WHERE key = ?", [licenseKey.trim()], (err, row) => {
-    if (err || !row) {
-      return res.status(403).json({ success: false, error: "Unauthorized" });
-    }
-
-    db.run("INSERT INTO downloads (license_id, file, ip) VALUES (?, ?, ?)", [row.id, fileName, userIP]);
-
-    const filePath = path.join(__dirname, 'downloads', fileName);
-    fs.access(filePath, fs.constants.F_OK, (err) => {
-      if (err) {
-        console.error("File not found:", filePath);
-        return res.status(404).json({ success: false, error: "File not found." });
-      }
-
-      res.download(filePath, err => {
-        if (err) {
-          console.error("File download error:", err.message);
-          res.status(500).json({ success: false, error: "Download failed." });
-        }
-      });
-    });
-  });
-});
-// ✅ S3 Secure Download Route for Marengo Documentation
-const AWS = require('aws-sdk');
-
-const s3 = new AWS.S3({
-  region: 'eu-central-1',
-  signatureVersion: 'v4',
 });
 
-const BUCKET_NAME = 'rythenox-downloads'; // Replace if you named it differently
-
+// ✅ Generate Signed S3 URL to Download File
 app.post('/api/downloads/request', async (req, res) => {
   const { fileId, clientId, timestamp } = req.body;
 
   if (!fileId || !clientId || !timestamp) {
-    return res.status(400).json({ success: false, error: "Missing parameters" });
+    return res.status(400).json({ success: false, error: "Missing parameters." });
   }
-
-  if (fileId !== 'documentation') {
-    return res.status(404).json({ success: false, error: "File not found" });
-  }
-
-  const fileKey = 'Marengo-product-desc-2025-uncensored.pdf';
-
-  const params = {
-    Bucket: BUCKET_NAME,
-    Key: fileKey,
-    Expires: 60,
-    ResponseContentDisposition: 'attachment',
-  };
 
   try {
-    const signedUrl = await s3.getSignedUrlPromise('getObject', params);
+    const allFiles = await s3.listObjectsV2({ Bucket: BUCKET_NAME }).promise();
+    const file = allFiles.Contents.find(obj =>
+      path.basename(obj.Key).replace(/\.[^/.]+$/, '').toLowerCase() === fileId
+    );
+
+    if (!file) {
+      return res.status(404).json({ success: false, error: "File not found." });
+    }
+
+    const signedUrl = await s3.getSignedUrlPromise('getObject', {
+      Bucket: BUCKET_NAME,
+      Key: file.Key,
+      Expires: 60,
+      ResponseContentDisposition: 'attachment',
+    });
+
     res.json({
       success: true,
       downloadUrl: signedUrl,
       expiresAt: new Date(Date.now() + 60000).toISOString(),
     });
   } catch (err) {
-    console.error('S3 Error:', err);
-    res.status(500).json({ success: false, error: "Failed to generate download link" });
+    console.error("S3 Signing Error:", err);
+    res.status(500).json({ success: false, error: "Failed to generate download link." });
   }
 });
 
 // ✅ Start the server
-app.listen(5000, () => {
-  console.log("✅ Marengo secure backend running");
-});
+app.listen(5000, () => console.log("✅ Marengo secure backend running"));
