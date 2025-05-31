@@ -1,11 +1,11 @@
-import express from 'express';
-import AWS from 'aws-sdk';
-import cors from 'cors';
-import path from 'path';
-import fs from 'fs';
-import sqlite3 from 'sqlite3';
-import { v4 as uuidv4 } from 'uuid';
-import rateLimit from 'express-rate-limit';
+const express = require('express');
+const AWS = require('aws-sdk');
+const cors = require('cors');
+const path = require('path');
+const fs = require('fs');
+const sqlite3 = require('sqlite3').verbose(); // note: `.verbose()` for logging
+const { v4: uuidv4 } = require('uuid');
+const rateLimit = require('express-rate-limit');
 
 const app = express();
 const BUCKET_NAME = 'rythenox-downloads';
